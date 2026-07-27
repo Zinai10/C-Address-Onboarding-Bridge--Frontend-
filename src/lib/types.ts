@@ -3,7 +3,7 @@ export type AddressType = "G" | "C";
 export interface WalletState {
   address: string | null;
   publicKey: string | null;
-  network: "PUBLIC" | "TESTNET";
+  network: StellarNetwork;
   isConnected: boolean;
 }
 
@@ -47,6 +47,9 @@ export const STELLAR_NETWORK = {
   PUBLIC: "PUBLIC",
   TESTNET: "TESTNET",
 } as const;
+
+/** The set of supported Stellar network identifiers. */
+export type StellarNetwork = keyof typeof STELLAR_NETWORK;
 
 export const SOROBAN_RPC_URL = {
   PUBLIC: "https://soroban-rpc.stellar.org",

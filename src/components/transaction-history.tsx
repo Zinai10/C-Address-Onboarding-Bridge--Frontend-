@@ -2,6 +2,7 @@ import React, { memo, useMemo } from "react";
 import { ArrowLeftRight, CreditCard, Building2, ExternalLink, Loader2 } from "lucide-react";
 import type { BridgeTransactionData } from "@/lib/stellar";
 import { getExplorerUrl } from "@/lib/stellar";
+import type { StellarNetwork } from "@/lib/types";
 
 const typeConfig: Record<string, { icon: typeof ArrowLeftRight; label: string; color: string }> = {
   "g-to-c": { icon: ArrowLeftRight, label: "G → C Bridge", color: "text-[var(--primary-light)]" },
@@ -18,7 +19,7 @@ const statusConfig: Record<string, { label: string; color: string }> = {
 interface Props {
   transactions: BridgeTransactionData[];
   loading: boolean;
-  network: "PUBLIC" | "TESTNET";
+  network: StellarNetwork;
 }
 
 const TransactionItem = memo(function TransactionItem({ tx, network }: { tx: BridgeTransactionData; network: Props["network"] }) {

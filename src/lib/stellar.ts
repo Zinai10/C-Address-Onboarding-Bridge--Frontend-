@@ -14,30 +14,30 @@ import {
   rpc,
   Account,
 } from "@stellar/stellar-sdk";
-import { BRIDGE_CONTRACT_ID } from "./types";
+import { BRIDGE_CONTRACT_ID, type StellarNetwork } from "./types";
 import { withSequenceRetry } from "./sequenceManager";
 
-const HORIZON_URLS = {
+const HORIZON_URLS: Record<StellarNetwork, string> = {
   PUBLIC: "https://horizon.stellar.org",
   TESTNET: "https://horizon-testnet.stellar.org",
 };
 
-const SOROBAN_RPC_URLS = {
+const SOROBAN_RPC_URLS: Record<StellarNetwork, string> = {
   PUBLIC: "https://soroban-rpc.stellar.org",
   TESTNET: "https://soroban-rpc-testnet.stellar.org",
 };
 
-export async function getHorizonServer(network: "PUBLIC" | "TESTNET"): Promise<Horizon.Server> {
+export async function getHorizonServer(network: StellarNetwork): Promise<Horizon.Server> {
   const { Horizon } = await import("@stellar/stellar-sdk");
   return new Horizon.Server(HORIZON_URLS[network]);
 }
 
-export async function getSorobanRpcServer(network: "PUBLIC" | "TESTNET"): Promise<rpc.Server> {
+export async function getSorobanRpcServer(network: StellarNetwork): Promise<rpc.Server> {
   const { rpc } = await import("@stellar/stellar-sdk");
   return new rpc.Server(SOROBAN_RPC_URLS[network]);
 }
 
-export async function getNetworkPassphrase(network: "PUBLIC" | "TESTNET"): Promise<string> {
+export async function getNetworkPassphrase(network: StellarNetwork): Promise<string> {
   const { Networks } = await import("@stellar/stellar-sdk");
   return network === "PUBLIC" ? Networks.PUBLIC : Networks.TESTNET;
 }
@@ -74,7 +74,7 @@ export async function getWalletAddress(): Promise<string | null> {
   }
 }
 
-export async function getCurrentNetwork(): Promise<"PUBLIC" | "TESTNET"> {
+export async function getCurrentNetwork(): Promise<StellarNetwork> {
   try {
     const result = await getNetwork();
     const networkName = String(result.network ?? "").toUpperCase();
@@ -140,7 +140,7 @@ interface HorizonPayment {
 
 export async function getAccountBalances(
   address: string,
-  network: "PUBLIC" | "TESTNET"
+  network: StellarNetwork
 ): Promise<AccountBalances> {
   const server = await getHorizonServer(network);
   try {
@@ -158,7 +158,7 @@ export async function getAccountBalances(
 
 export async function fetchRecentTransactions(
   address: string,
-  network: "PUBLIC" | "TESTNET",
+  network: StellarNetwork,
   limit: number = 10
 ): Promise<BridgeTransactionData[]> {
   const server = await getHorizonServer(network);
@@ -186,38 +186,41 @@ export async function fetchRecentTransactions(
   }
 }
 
-export async function buildAndSubmitPayment(
+/**
+ * Internal helper that handles the shared transaction-building flow used by
+ * both buildAndSubmitPayment and bridgeViaContract:
+ *   1. Retries on sequence-number conflicts via withSequenceRetry
+ *   2. Constructs the Account and TransactionBuilder
+ *   3. Signs the XDR via Freighter
+ *   4. Rebuilds the signed transaction and submits it
+ *
+ * Callers supply the resolved `destination` and `asset` up-front so that the
+ * two public functions keep their own destination/asset-resolution logic.
+ *
+ * @param sourceAddress - The G-address that will sign and pay fees
+ * @param destination   - The resolved destination address for the payment
+ * @param asset         - The resolved Stellar Asset to send
+ * @param amount        - Amount as a decimal string (e.g. "10.5")
+ * @param network       - "PUBLIC" or "TESTNET"
+ * @param server        - An already-initialised Horizon.Server instance
+ * @param passphrase    - The network passphrase for signing/rebuilding
+ */
+async function buildSignAndSubmit(
   sourceAddress: string,
-  destinationAddress: string,
+  destination: string,
+  asset: Asset,
   amount: string,
-  assetCode: string,
-  network: "PUBLIC" | "TESTNET"
+  network: StellarNetwork,
+  server: Horizon.Server,
+  passphrase: string
 ): Promise<PaymentResult> {
-  const server = await getHorizonServer(network);
-  const passphrase = await getNetworkPassphrase(network);
-  const { TransactionBuilder, Operation, BASE_FEE, Asset } = await import("@stellar/stellar-sdk");
-  type AssetType = InstanceType<typeof Asset>;
+  const { TransactionBuilder, Operation, BASE_FEE } = await import("@stellar/stellar-sdk");
 
-  const result = await withSequenceRetry(
+  return withSequenceRetry(
     sourceAddress,
     async (getSequence) => {
       const sequence = await getSequence();
       const account = new Account(sourceAddress, (sequence - 1n).toString());
-
-      // Load balances for asset validation
-      const horizonAccount = await server.loadAccount(sourceAddress);
-      let asset: Asset;
-
-      if (assetCode === "XLM") {
-        asset = Asset.native();
-      } else {
-        const balances = horizonAccount.balances as HorizonBalance[];
-        const matchingBalance = balances.find((b) => b.asset_code === assetCode);
-        if (!matchingBalance) {
-          throw new Error(`No ${assetCode} trustline found for this account`);
-        }
-        asset = new Asset(assetCode, matchingBalance.asset_issuer);
-      }
 
       const tx = new TransactionBuilder(account, {
         fee: BASE_FEE,
@@ -225,7 +228,7 @@ export async function buildAndSubmitPayment(
       })
         .addOperation(
           Operation.payment({
-            destination: destinationAddress,
+            destination,
             asset,
             amount,
           })
@@ -245,7 +248,6 @@ export async function buildAndSubmitPayment(
       const signedTx = TransactionBuilder.fromXDR(signedXDR, passphrase);
 
       const submitResult = await server.submitTransaction(signedTx);
-
       return {
         hash: submitResult.hash,
         successful: submitResult.successful,
@@ -253,8 +255,43 @@ export async function buildAndSubmitPayment(
     },
     server
   );
+}
 
-  return result;
+export async function buildAndSubmitPayment(
+  sourceAddress: string,
+  destinationAddress: string,
+  amount: string,
+  assetCode: string,
+  network: StellarNetwork
+): Promise<PaymentResult> {
+  const server = await getHorizonServer(network);
+  const passphrase = await getNetworkPassphrase(network);
+  const { Asset } = await import("@stellar/stellar-sdk");
+
+  // Resolve the asset, validating any non-native trustline against the account
+  const horizonAccount = await server.loadAccount(sourceAddress);
+  let asset: Asset;
+
+  if (assetCode === "XLM") {
+    asset = Asset.native();
+  } else {
+    const balances = horizonAccount.balances as HorizonBalance[];
+    const matchingBalance = balances.find((b) => b.asset_code === assetCode);
+    if (!matchingBalance) {
+      throw new Error(`No ${assetCode} trustline found for this account`);
+    }
+    asset = new Asset(assetCode, matchingBalance.asset_issuer);
+  }
+
+  return buildSignAndSubmit(
+    sourceAddress,
+    destinationAddress,
+    asset,
+    amount,
+    network,
+    server,
+    passphrase
+  );
 }
 
 export async function bridgeViaContract(
@@ -262,7 +299,7 @@ export async function bridgeViaContract(
   cAddress: string,
   amount: string,
   assetCode: string,
-  network: "PUBLIC" | "TESTNET"
+  network: StellarNetwork
 ): Promise<PaymentResult> {
   if (!BRIDGE_CONTRACT_ID) {
     return buildAndSubmitPayment(sourceAddress, cAddress, amount, assetCode, network);
@@ -270,65 +307,34 @@ export async function bridgeViaContract(
 
   const server = await getHorizonServer(network);
   const passphrase = await getNetworkPassphrase(network);
-  const { TransactionBuilder, Operation, BASE_FEE, Asset } = await import("@stellar/stellar-sdk");
+  const { Asset } = await import("@stellar/stellar-sdk");
 
-  const result = await withSequenceRetry(
-    sourceAddress,
-    async (getSequence) => {
-      const sequence = await getSequence();
-      const account = new Account(sourceAddress, (sequence - 1n).toString());
+  // The contract always receives native XLM; cAddress is handled by the contract
+  const asset = Asset.native();
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: passphrase,
-      })
-        .addOperation(
-          Operation.payment({
-            destination: BRIDGE_CONTRACT_ID,
-            asset: Asset.native(),
-            amount,
-          })
-        )
-        .setTimeout(30)
-        .build();
-
-      const unsignedXDR = tx.toXDR();
-
-      const signedResult = await signTransaction(unsignedXDR, {
-        networkPassphrase: passphrase,
-      });
-
-      if ("error" in signedResult && signedResult.error) {
-        throw new Error(`Signing failed: ${signedResult.error}`);
-      }
-
-      const signedXDR = (signedResult as { signedTxXdr: string }).signedTxXdr;
-      const signedTx = TransactionBuilder.fromXDR(signedXDR, passphrase);
-
-      try {
-        const submitResult = await server.submitTransaction(signedTx);
-        return {
-          hash: submitResult.hash,
-          successful: submitResult.successful,
-        };
-      } catch (e: unknown) {
-        const err = e as { response?: { data?: { extras?: { result_codes?: unknown } } } };
-        if (err.response?.data?.extras?.result_codes) {
-          throw new Error(
-            `Transaction failed: ${JSON.stringify(err.response.data.extras.result_codes)}`
-          );
-        }
-        throw e;
-      }
-    },
-    server
-  );
-
-  return result;
+  try {
+    return await buildSignAndSubmit(
+      sourceAddress,
+      BRIDGE_CONTRACT_ID,
+      asset,
+      amount,
+      network,
+      server,
+      passphrase
+    );
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { extras?: { result_codes?: unknown } } } };
+    if (err.response?.data?.extras?.result_codes) {
+      throw new Error(
+        `Transaction failed: ${JSON.stringify(err.response.data.extras.result_codes)}`
+      );
+    }
+    throw e;
+  }
 }
 
 export function getExplorerUrl(
-  network: "PUBLIC" | "TESTNET",
+  network: StellarNetwork,
   type: "tx" | "account" | "contract",
   id: string
 ): string {
